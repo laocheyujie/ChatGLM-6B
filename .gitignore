@@ -132,3 +132,6 @@ dmypy.json
 # Mac system file
 model/
 .idea
+
+# Fine-tuning results
+output/
