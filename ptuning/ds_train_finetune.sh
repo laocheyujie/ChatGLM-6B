@@ -3,6 +3,7 @@ LR=1e-4
 
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
+# 为deepspeed命令随机选择一个在10000-65535范围内的端口号，并使用4个GPU来运行main.py脚本
 deepspeed --num_gpus=4 --master_port $MASTER_PORT main.py \
     --deepspeed deepspeed.json \
     --do_train \
