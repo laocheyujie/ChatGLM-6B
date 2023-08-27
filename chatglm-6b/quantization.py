@@ -10,7 +10,7 @@ from transformers.utils import logging
 from typing import List
 from functools import partial  # 从functools模块导入partial，可以用来固定函数的部分参数，返回新的partial对象
 
-logger = logging.get_logger(__name__)
+logger = logging.get_logger(__name__)  # 创建一个logger，名字为当前模块的名称
 
 try:
     # 从cpm_kernels.kernels.base模块导入LazyKernelCModule，KernelFunction和round_up
@@ -39,6 +39,7 @@ try:
             "int8WeightExtractionHalf",
         ],
     )
+# 如果在加载过程中出现任何异常，kernels 设为 None，并记录警告信息
 except Exception as exception:
     kernels = None
     logger.warning("Failed to load cpm_kernels:" + str(exception))
@@ -54,9 +55,12 @@ class W8A16Linear(torch.autograd.Function):
         ctx.weight_bit_width = weight_bit_width
         out_features = quant_w.size(0)
         inp = inp.contiguous().view(-1, inp.size(-1))
+        # 提取权重的半精度浮点数表示
         weight = extract_weight_to_half(quant_w, scale_w, weight_bit_width)
         ctx.weight_shape = weight.size()
+        # 计算输出
         output = inp.mm(weight.t())
+        # 保存必要的信息，供后向传播时使用
         ctx.save_for_backward(inp, quant_w, scale_w)
         return output.view(*(ctx.inp_shape[:-1] + (out_features,)))
 
@@ -64,13 +68,16 @@ class W8A16Linear(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         # 提取前向传播时保存的信息
         inp, quant_w, scale_w = ctx.saved_tensors
+        # 提取权重的半精度浮点数表示
         weight = extract_weight_to_half(quant_w, scale_w, ctx.weight_bit_width)
         grad_output = grad_output.contiguous().view(-1, weight.size(0))
+        # 计算输入和权重的梯度
         grad_input = grad_output.mm(weight)
         grad_weight = grad_output.t().mm(inp)
         return grad_input.view(ctx.inp_shape), grad_weight.view(ctx.weight_shape), None, None
 
 
+# 定义一个函数，用于将权重压缩为 int4 格式
 def compress_int4_weight(weight: torch.Tensor):  # (n, m)
     with torch.cuda.device(weight.device):
         n, m = weight.size(0), weight.size(1)
@@ -84,6 +91,7 @@ def compress_int4_weight(weight: torch.Tensor):  # (n, m)
         gridDim = (n, 1, 1)
         blockDim = (min(round_up(m, 32), 1024), 1, 1)
 
+        # 调用 CUDA kernels 进行权重压缩
         kernels.int4WeightCompression(
             gridDim,
             blockDim,
@@ -117,6 +125,7 @@ def extract_weight_to_half(weight: torch.Tensor, scale_list: torch.Tensor, sourc
         gridDim = (n, 1, 1)
         blockDim = (min(round_up(m, 32), 1024), 1, 1)  # round_up(m, 32)  将数字m向上取整至最近的32的倍数
         # 因为很多并行操作更高效地运行在某些固定大小的线程块中（如32）
+        # 调用 CUDA kernels 提取权重
         func(
             gridDim,
             blockDim,
@@ -155,43 +164,60 @@ blockDim:
 考虑一个简单的例子，假设你想对一个10000元素的数组的每个元素进行操作。你可以选择每个线程块有100个线程，那么你需要100个这样的线程块来覆盖整个数组。因此，你的blockDim将是100，gridDim将是10000/100=100。
 """
 
+
+# 定义一个名为 QuantizedLinear 的类，该类继承自 PyTorch 中的 Linear 类
 class QuantizedLinear(Linear):
+    # 初始化函数，接受一些参数，包括权重的位宽、权重张量、偏置张量等
     def __init__(self, weight_bit_width: int, weight_tensor=None, bias_tensor=None, empty_init=False, *args, **kwargs):
+        # 调用父类的初始化函数
         super(QuantizedLinear, self).__init__(*args, **kwargs)
+        # 保存权重的位宽
         self.weight_bit_width = weight_bit_width
 
+        # 获取权重的形状，并删除父类中的权重
         shape = self.weight.shape
         del self.weight
 
+        # 如果未指定权重张量，或者指定了空初始化，则初始化权重和权重的量化尺度
         if weight_tensor is None or empty_init:
             self.weight = torch.empty(
                 shape[0], shape[1] * weight_bit_width // 8, dtype=torch.int8, device=kwargs["device"]
             )
             self.weight_scale = torch.empty(shape[0], dtype=kwargs["dtype"], device=kwargs["device"])
-        else:
+        else:  # 否则，计算权重的量化值和量化尺度
             self.weight_scale = (weight_tensor.abs().max(dim=-1).values / ((2 ** (weight_bit_width - 1)) - 1)).half()
-            self.weight = torch.round(weight_tensor / self.weight_scale[:, None]).to(torch.int8)  # self.weight_scale[:, None]中的[:, None]增加了一个额外的维度。这样做是为了进行广播操作，使每行的权重都可以除以对应的self.weight_scale值。换句话说，这将self.weight_scale从形状(n,)转换为形状(n, 1)，其中n是行数
+            # self.weight_scale[:, None]中的[:, None]增加了一个额外的维度。这样做是为了进行广播操作，使每行的权重都可以除以对应的self.weight_scale值。
+            # 换句话说，这将self.weight_scale从形状(n,)转换为形状(n, 1)，其中n是行数
+            self.weight = torch.round(weight_tensor / self.weight_scale[:, None]).to(torch.int8)
             if weight_bit_width == 4:
                 self.weight = compress_int4_weight(self.weight)
 
+        # 将权重和权重的量化尺度设置为参数，并指定它们不需要梯度
         self.weight = Parameter(self.weight.to(kwargs["device"]), requires_grad=False)
         self.weight_scale = Parameter(self.weight_scale.to(kwargs["device"]), requires_grad=False)
+        # 如果指定了偏置张量，将偏置设置为参数，并指定它不需要梯度
         if bias_tensor is not None:
             self.bias = Parameter(bias_tensor.to(kwargs["device"]), requires_grad=False)
-        else:
+        else:  # 否则，偏置设为 None
             self.bias = None
 
+    # 定义前向传播函数
     def forward(self, input):
+        # 应用 W8A16Linear 函数计算输出
         output = W8A16Linear.apply(input, self.weight, self.weight_scale, self.weight_bit_width)
+        # 如果存在偏置，将偏置加到输出上
         if self.bias is not None:
             output = output + self.bias
         return output
 
 
+# 定义一个函数，用于将模型中的线性层替换为量化的线性层
 def quantize(model, weight_bit_width, empty_init=False, **kwargs):
     """Replace fp16 linear with quantized linear"""
 
+    # 遍历模型中的每一层
     for layer in model.layers:
+        # 将每一层中的 query_key_value 替换为量化的线性层
         layer.attention.query_key_value = QuantizedLinear(
             weight_bit_width=weight_bit_width,
             weight_tensor=layer.attention.query_key_value.weight.to(torch.cuda.current_device()),
@@ -203,6 +229,7 @@ def quantize(model, weight_bit_width, empty_init=False, **kwargs):
             device=layer.attention.query_key_value.weight.device,
             empty_init=empty_init
         )
+        # 将每一层中的 dense 替换为量化的线性层
         layer.attention.dense = QuantizedLinear(
             weight_bit_width=weight_bit_width,
             weight_tensor=layer.attention.dense.weight.to(torch.cuda.current_device()),
@@ -214,6 +241,7 @@ def quantize(model, weight_bit_width, empty_init=False, **kwargs):
             device=layer.attention.dense.weight.device,
             empty_init=empty_init
         )
+        # 将每一层中的 dense_h_to_4h 替换为量化的线性层
         layer.mlp.dense_h_to_4h = QuantizedLinear(
             weight_bit_width=weight_bit_width,
             weight_tensor=layer.mlp.dense_h_to_4h.weight.to(torch.cuda.current_device()),
@@ -225,6 +253,7 @@ def quantize(model, weight_bit_width, empty_init=False, **kwargs):
             device=layer.mlp.dense_h_to_4h.weight.device,
             empty_init=empty_init
         )
+        # 将每一层中的 dense_4h_to_h 替换为量化的线性层
         layer.mlp.dense_4h_to_h = QuantizedLinear(
             weight_bit_width=weight_bit_width,
             weight_tensor=layer.mlp.dense_4h_to_h.weight.to(torch.cuda.current_device()),
